@@ -85,6 +85,32 @@ export function useTerminalSession({
         new WebLinksAddon((_e, uri) => openUrl(uri).catch(console.error)),
       );
 
+      // Word / line delete bindings — xterm.js sends 0x7f for plain
+      // Backspace, but Ctrl/Alt/Cmd+Backspace by default also collapse to
+      // 0x7f, so the shell can't tell them apart. Translate the modifier
+      // combos to the readline control sequences shells already understand:
+      //   Ctrl+Backspace  → ^W   (backward-kill-word)
+      //   Alt+Backspace   → ESC ^? (also backward-kill-word in readline)
+      //   Cmd+Backspace   → ^U   (unix-line-discard, macOS convention)
+      term.attachCustomKeyEventHandler((e) => {
+        if (e.type !== "keydown" || e.key !== "Backspace") return true;
+        const session = ptyRef.current;
+        if (!session) return true;
+        if (e.ctrlKey && !e.altKey && !e.metaKey) {
+          session.write("\x17");
+          return false;
+        }
+        if (e.altKey && !e.ctrlKey && !e.metaKey) {
+          session.write("\x1b\x7f");
+          return false;
+        }
+        if (e.metaKey && !e.ctrlKey && !e.altKey) {
+          session.write("\x15");
+          return false;
+        }
+        return true;
+      });
+
       term.open(container.current);
       fit.fit();
 
