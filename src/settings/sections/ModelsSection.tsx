@@ -32,11 +32,19 @@ import {
   setOpenaiCompatibleBaseURL,
   setOpenaiCompatibleModelId,
 } from "@/modules/settings/store";
+import {
+  lmEnsureReady,
+  lmListModels,
+  type LmModel,
+  type LmReadyState,
+} from "@/modules/ai/lib/lmstudio";
 import { invoke } from "@tauri-apps/api/core";
 import {
   ArrowDown01Icon,
   CheckmarkCircle02Icon,
   Cancel01Icon,
+  Loading03Icon,
+  RefreshIcon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useEffect, useMemo, useState } from "react";
@@ -230,42 +238,68 @@ function LocalModelsBlock() {
   const modelId = usePreferencesStore((s) => s.lmstudioModelId);
   const [urlDraft, setUrlDraft] = useState(baseURL);
   const [modelDraft, setModelDraft] = useState(modelId);
-  const [testStatus, setTestStatus] = useState<
-    "idle" | "testing" | "ok" | "fail"
-  >("idle");
+  const [connectState, setConnectState] = useState<LmReadyState | "idle">(
+    "idle",
+  );
+  const [models, setModels] = useState<LmModel[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => setUrlDraft(baseURL), [baseURL]);
   useEffect(() => setModelDraft(modelId), [modelId]);
 
-  const dirty =
-    urlDraft.trim() !== baseURL || modelDraft.trim() !== modelId;
+  const urlDirty = urlDraft.trim() !== baseURL;
 
-  const save = async () => {
+  const persistUrl = async () => {
     const u = urlDraft.trim();
-    const m = modelDraft.trim();
     if (u && u !== baseURL) await setLmstudioBaseURL(u);
-    if (m !== modelId) await setLmstudioModelId(m);
   };
 
-  const test = async () => {
-    setTestStatus("testing");
+  const refreshModels = async (url: string) => {
+    setRefreshing(true);
     try {
-      const status = await invoke<number>("lm_ping", {
-        baseUrl: urlDraft,
-      });
-      setTestStatus(status > 0 ? "ok" : "fail");
+      const list = await lmListModels(url);
+      setModels(list);
+      // If the saved model id isn't in the live list, leave the user's pick
+      // alone — they may have unloaded it temporarily. But if no id is saved
+      // at all and the server has exactly one model, auto-pick it.
+      if (!modelDraft.trim() && list.length === 1) {
+        await setLmstudioModelId(list[0].id);
+      }
     } catch {
-      setTestStatus("fail");
+      setModels([]);
+    } finally {
+      setRefreshing(false);
     }
   };
+
+  const connect = async () => {
+    await persistUrl();
+    const url = urlDraft.trim() || baseURL;
+    if (!url) return;
+    const ok = await lmEnsureReady(url, {
+      onState: setConnectState,
+    });
+    if (ok) {
+      await refreshModels(url);
+    }
+  };
+
+  const pickModel = async (id: string) => {
+    setModelDraft(id);
+    if (id !== modelId) await setLmstudioModelId(id);
+  };
+
+  const connected = connectState === "ready";
+  const showManualInput = !connected || models.length === 0;
 
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-col gap-0.5">
         <Label>Local — LM Studio</Label>
         <span className="text-[10.5px] leading-relaxed text-muted-foreground">
-          Run any GGUF model on your machine via LM Studio's HTTP server. Enable
-          the server in LM Studio → Developer tab.
+          Run any GGUF model on your machine via LM Studio's HTTP server.
+          Connect auto-launches LM Studio and lists the models it's serving —
+          no manual typing if a model is loaded.
         </span>
       </div>
 
@@ -275,58 +309,180 @@ function LocalModelsBlock() {
             <Input
               value={urlDraft}
               onChange={(e) => setUrlDraft(e.target.value)}
-              onBlur={() => {
-                const v = urlDraft.trim();
-                if (v && v !== baseURL) void setLmstudioBaseURL(v);
-              }}
+              onBlur={() => void persistUrl()}
               placeholder="http://localhost:1234/v1"
               spellCheck={false}
               className="h-8 flex-1 font-mono text-[11.5px]"
             />
             <Button
               size="sm"
-              variant="outline"
-              onClick={() => void test()}
-              disabled={!urlDraft.trim()}
+              onClick={() => void connect()}
+              disabled={
+                !urlDraft.trim() ||
+                connectState === "checking" ||
+                connectState === "launching" ||
+                connectState === "waiting"
+              }
               className="h-8 px-3 text-[11px]"
             >
-              Test
-            </Button>
-            <Button
-              size="sm"
-              onClick={() => void save()}
-              disabled={!dirty}
-              className="h-8 px-3 text-[11px]"
-            >
-              Save
+              {connectState === "checking" ||
+              connectState === "launching" ||
+              connectState === "waiting"
+                ? "Connecting…"
+                : connected
+                  ? "Reconnect"
+                  : "Connect"}
             </Button>
           </div>
         </FieldRow>
 
-        <FieldRow label="Model ID">
-          <Input
-            value={modelDraft}
-            onChange={(e) => setModelDraft(e.target.value)}
-            onBlur={() => {
-              const v = modelDraft.trim();
-              if (v !== modelId) void setLmstudioModelId(v);
-            }}
-            placeholder="qwen2.5-coder-7b-instruct"
-            spellCheck={false}
-            className="h-8 font-mono text-[11.5px]"
-          />
+        <FieldRow label="Model">
+          {showManualInput ? (
+            <Input
+              value={modelDraft}
+              onChange={(e) => setModelDraft(e.target.value)}
+              onBlur={() => {
+                const v = modelDraft.trim();
+                if (v !== modelId) void setLmstudioModelId(v);
+              }}
+              placeholder="qwen2.5-coder-7b-instruct"
+              spellCheck={false}
+              className="h-8 font-mono text-[11.5px]"
+            />
+          ) : (
+            <div className="flex flex-1 items-center gap-1.5">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 flex-1 justify-between font-mono text-[11.5px]"
+                  >
+                    <span className="truncate">
+                      {modelDraft.trim() || "Select a loaded model…"}
+                    </span>
+                    <HugeiconsIcon
+                      icon={ArrowDown01Icon}
+                      size={11}
+                      strokeWidth={2}
+                      className="opacity-70"
+                    />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent className="max-h-72 w-[--radix-dropdown-menu-trigger-width] overflow-y-auto">
+                  {models.map((m) => (
+                    <DropdownMenuItem
+                      key={m.id}
+                      onSelect={() => void pickModel(m.id)}
+                      className="font-mono text-[11.5px]"
+                    >
+                      {m.id}
+                      {m.id === modelDraft.trim() ? (
+                        <HugeiconsIcon
+                          icon={CheckmarkCircle02Icon}
+                          size={11}
+                          strokeWidth={2}
+                          className="ml-auto text-emerald-500"
+                        />
+                      ) : null}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={() =>
+                  void refreshModels(urlDraft.trim() || baseURL)
+                }
+                disabled={refreshing}
+                className="h-8 w-8"
+                title="Refresh model list"
+                aria-label="Refresh model list"
+              >
+                <HugeiconsIcon
+                  icon={refreshing ? Loading03Icon : RefreshIcon}
+                  size={13}
+                  strokeWidth={1.75}
+                  className={refreshing ? "animate-spin" : ""}
+                />
+              </Button>
+            </div>
+          )}
         </FieldRow>
 
-        <StatusLine status={testStatus} />
+        <ConnectStatus
+          state={connectState}
+          modelCount={models.length}
+          urlDirty={urlDirty}
+        />
 
-        {!modelId.trim() ? (
+        {!modelDraft.trim() && connectState !== "ready" ? (
           <p className="text-[10.5px] leading-relaxed text-amber-600 dark:text-amber-400">
-            Enter the model id that's loaded in LM Studio — e.g. the one shown
-            on the server's <span className="font-mono">/v1/models</span> page.
+            Click <span className="font-medium">Connect</span> to auto-launch
+            LM Studio and list its models. Or paste a model id manually if the
+            server is already running and you know what's loaded.
           </p>
         ) : null}
       </div>
     </div>
+  );
+}
+
+function ConnectStatus({
+  state,
+  modelCount,
+  urlDirty,
+}: {
+  state: LmReadyState | "idle";
+  modelCount: number;
+  urlDirty: boolean;
+}) {
+  if (state === "idle") {
+    return urlDirty ? (
+      <span className="text-[10.5px] text-muted-foreground">
+        Click Connect to test the new base URL.
+      </span>
+    ) : null;
+  }
+  if (state === "checking") {
+    return (
+      <span className="text-[10.5px] text-muted-foreground">
+        Checking server…
+      </span>
+    );
+  }
+  if (state === "launching") {
+    return (
+      <span className="text-[10.5px] text-muted-foreground">
+        Server not responding — launching LM Studio…
+      </span>
+    );
+  }
+  if (state === "waiting") {
+    return (
+      <span className="text-[10.5px] text-muted-foreground">
+        Waiting for the server to come up… (this can take up to 30s)
+      </span>
+    );
+  }
+  if (state === "ready") {
+    return (
+      <span className="flex items-center gap-1 text-[10.5px] text-emerald-600 dark:text-emerald-400">
+        <HugeiconsIcon icon={CheckmarkCircle02Icon} size={11} strokeWidth={2} />
+        Connected — {modelCount === 0
+          ? "no models loaded yet, load one in LM Studio"
+          : `${modelCount} model${modelCount === 1 ? "" : "s"} available`}
+        .
+      </span>
+    );
+  }
+  return (
+    <span className="flex items-center gap-1 text-[10.5px] text-destructive">
+      <HugeiconsIcon icon={Cancel01Icon} size={11} strokeWidth={2} />
+      Couldn't connect — start LM Studio's server manually (Developer tab) or
+      install it from lmstudio.ai.
+    </span>
   );
 }
 

@@ -50,6 +50,161 @@ fn is_blocked_host(host: &str) -> bool {
     )
 }
 
+#[derive(Debug, Serialize)]
+pub struct LmModelEntry {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owned_by: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LmModelsResponse {
+    data: Vec<LmModelRaw>,
+}
+
+#[derive(Deserialize)]
+struct LmModelRaw {
+    id: String,
+    #[serde(default)]
+    owned_by: Option<String>,
+}
+
+#[tauri::command]
+pub async fn lm_list_models(base_url: String) -> Result<Vec<LmModelEntry>, String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("empty base url".into());
+    }
+    let probe = format!("{trimmed}/models");
+    let parsed = reqwest::Url::parse(&probe).map_err(|e| e.to_string())?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        s => return Err(format!("scheme not allowed: {s}")),
+    }
+
+    let host = parsed.host_str().ok_or_else(|| "missing host".to_string())?;
+    if is_blocked_host(host) {
+        return Err(format!("host not allowed: {host}"));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("server returned HTTP {}", resp.status().as_u16()));
+    }
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    let body: LmModelsResponse =
+        serde_json::from_str(&text).map_err(|e| format!("invalid JSON: {e}"))?;
+    Ok(body
+        .data
+        .into_iter()
+        .map(|m| LmModelEntry {
+            id: m.id,
+            owned_by: m.owned_by,
+        })
+        .collect())
+}
+
+// Best-effort launch of LM Studio in the background. Tries the `lms` CLI first
+// (it starts the HTTP server directly), then falls back to opening the app
+// itself per-OS. Fire-and-forget — caller polls `lm_ping` until the server
+// answers.
+#[tauri::command]
+pub async fn lm_open_app() -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    // Preferred path: `lms server start` — starts the headless server even
+    // when the GUI isn't running. Available on every OS where LM Studio is
+    // installed and its CLI is on PATH (`lms bootstrap` adds it).
+    if let Ok(mut child) = Command::new("lms")
+        .args(["server", "start", "--quiet"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        let _ = child.try_wait();
+        return Ok(());
+    }
+
+    // Fallback: launch the GUI app and rely on its "auto-start server on
+    // launch" setting (default in recent versions).
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .args(["-ga", "LM Studio"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("open -a 'LM Studio' failed: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // LM Studio's default per-user installer drops the binary under
+        // %LOCALAPPDATA%\LM-Studio\app-<version>\LM Studio.exe — locate the
+        // newest install by scanning the directory rather than hardcoding
+        // a version.
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let root = std::path::PathBuf::from(local).join("LM-Studio");
+            if let Ok(read) = std::fs::read_dir(&root) {
+                let mut newest: Option<std::path::PathBuf> = None;
+                for entry in read.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("app-") {
+                        let exe = entry.path().join("LM Studio.exe");
+                        if exe.is_file()
+                            && newest
+                                .as_ref()
+                                .map(|p| p.file_name() < exe.file_name())
+                                .unwrap_or(true)
+                        {
+                            newest = Some(exe);
+                        }
+                    }
+                }
+                if let Some(exe) = newest {
+                    Command::new(exe)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .map_err(|e| format!("launch failed: {e}"))?;
+                    return Ok(());
+                }
+            }
+        }
+        return Err("LM Studio not found — install it from https://lmstudio.ai".into());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        for candidate in ["lm-studio", "lmstudio", "LM_Studio"] {
+            if Command::new(candidate)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        return Err("LM Studio not found on PATH — install it from https://lmstudio.ai or ensure the AppImage is on PATH".into());
+    }
+
+    #[cfg_attr(any(target_os = "macos", target_os = "windows", target_os = "linux"), allow(unreachable_code))]
+    Err("LM Studio auto-launch is not supported on this platform".into())
+}
+
 // AI HTTP proxy — bypasses webview CORS / Mixed-Content / PNA so local-network
 // model servers (LM Studio, Ollama, vLLM) work in the production bundle.
 

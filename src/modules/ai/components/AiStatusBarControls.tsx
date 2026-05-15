@@ -51,6 +51,7 @@ import {
   type ProviderId,
 } from "../config";
 import { ACCEPTED_FILES, useComposer } from "../lib/composer";
+import { lmEnsureReady } from "../lib/lmstudio";
 import { toggleFavoriteModel } from "../lib/modelPrefs";
 import { useChatStore } from "../store/chatStore";
 import { usePreferencesStore } from "@/modules/settings/preferences";
@@ -392,6 +393,18 @@ function ModelDropdown() {
                       return;
                     }
                     setSelected(m.id as ModelId);
+                    // LM Studio is keyless and local — if the user picks it
+                    // while the server isn't running, kick off a launch in
+                    // the background so the first chat doesn't fail with
+                    // "could not reach server". Fire-and-forget; the Settings
+                    // panel surfaces detailed status.
+                    if (m.provider === "lmstudio") {
+                      const baseURL =
+                        usePreferencesStore.getState().lmstudioBaseURL;
+                      if (baseURL.trim()) {
+                        void lmEnsureReady(baseURL);
+                      }
+                    }
                   }}
                   onToggleFavorite={() => void toggleFavoriteModel(m.id)}
                 />

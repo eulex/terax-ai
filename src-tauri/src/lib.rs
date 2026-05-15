@@ -118,6 +118,8 @@ pub fn run() {
             secrets::secrets_delete,
             secrets::secrets_get_all,
             net::lm_ping,
+            net::lm_list_models,
+            net::lm_open_app,
             net::ai_http_request,
             net::ai_http_stream,
         ])
